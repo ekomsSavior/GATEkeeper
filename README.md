@@ -14,7 +14,7 @@ GATEkeeper by: ek0mssavior.dev
 
 ## Overview
 
-GATEkeeper is a reconnaissance tool that launches a real Chromium browser, simulates human‑like interaction (mouse movements, scrolling, key presses), and captures all network traffic to force hidden redirects or reveal behind‑the‑scenes content. It is designed for penetration testers and security researchers who need to analyze heavily protected websites, gatekeeper pages, or Cloudflare‑challenged endpoints.
+GATEkeeper is a reconnaissance tool that launches a Chromium browser, simulates human like interaction (mouse movements, scrolling, key presses), and captures all network traffic to force hidden redirects or reveal behind‑the‑scenes content.
 
 The tool stores every request/response, saves response bodies, generates a structured JSON report, and can even create HAR traces. It works out of the box on most modern web applications, including those protected by anti‑bot mechanisms.
 
