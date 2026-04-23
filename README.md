@@ -1,5 +1,5 @@
 <div align="center">
-GATEkeeper
+GATEkeeper by: ek0mssavior.dev
 </div>
 
 <div align="center">
