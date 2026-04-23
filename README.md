@@ -1,5 +1,5 @@
 <div align="center">
-# GATEkeeper
+GATEkeeper
 </div>
 
 <div align="center">
