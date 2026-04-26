@@ -51,13 +51,13 @@ git clone https://github.com/ekomsSavior/GATEkeeper.git
 cd GATEkeeper
 
 # Install required Python package
-pip install playwright
+pip install playwright --break-system-packages
 
 # Install Chromium browser (required)
 playwright install chromium
 
 # (Optional) Install playwright-stealth for better anti‑detection
-pip install playwright-stealth
+pip install playwright-stealth --break-system-packages
 ```
 
 No additional setup is required.
