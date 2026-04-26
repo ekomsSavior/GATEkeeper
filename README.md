@@ -4,7 +4,7 @@ GATEkeeper by: ek0mssavior.dev
 
 <div align="center">
 
-**Advanced Browser Automation for Gatekeeper Bypass & Network Reconnaissance**
+**Advanced Browser Automation for Gatekeeper Bypass & Network Recon**
 
 [Features](#features) • [Installation](#installation) • [Usage](#usage) • [Options](#options) • [Output](#output) • [Disclaimer](#disclaimer)
 
