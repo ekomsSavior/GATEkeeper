@@ -3,6 +3,8 @@
 GATEkeeper - Browser interaction + network recon for authorized testing.
 
 Features:
+- Single URL scanning
+- Bulk target scanning from file
 - Interactive prompts or CLI arguments
 - Cookie loading
 - Custom headers
@@ -12,6 +14,7 @@ Features:
 - Technology fingerprinting
 - Security header analysis
 - JSON report generation
+- Aggregate bulk report generation
 """
 
 import argparse
@@ -113,6 +116,7 @@ class GatekeeperBanger:
         self.main_response_headers = {}
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
         self.bodies_dir = self.output_dir / "response_bodies"
         if self.save_bodies:
             self.bodies_dir.mkdir(parents=True, exist_ok=True)
@@ -661,6 +665,44 @@ class GatekeeperBanger:
             print("\n[-] No final HTML captured.")
 
 
+def normalize_url(value: str, default_scheme: str = "https") -> str:
+    value = value.strip().strip(",")
+
+    if not value:
+        return ""
+
+    if not value.startswith(("http://", "https://")):
+        value = f"{default_scheme}://{value}"
+
+    return value
+
+
+def load_targets(input_file: Path, default_scheme: str = "https") -> list[str]:
+    targets = []
+
+    with open(input_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            url = normalize_url(line, default_scheme=default_scheme)
+
+            if url:
+                targets.append(url)
+
+    seen = set()
+    deduped = []
+
+    for target in targets:
+        if target not in seen:
+            seen.add(target)
+            deduped.append(target)
+
+    return deduped
+
+
 def sanitize_domain_name(url: str) -> str:
     parsed = urlparse(url if "://" in url else f"http://{url}")
     domain = parsed.netloc or parsed.path.split("/")[0]
@@ -686,12 +728,106 @@ def parse_header(header_values):
     return headers
 
 
+async def run_single_target(target_url, args, custom_headers, output_base=None):
+    domain_name = sanitize_domain_name(target_url)
+
+    if output_base:
+        output_dir = output_base / domain_name
+    elif args.output:
+        output_dir = Path(args.output)
+    else:
+        output_dir = Path(f"./{domain_name}_bang")
+
+    banger = GatekeeperBanger(
+        target_url=target_url,
+        output_dir=output_dir,
+        headless=args.headless,
+        timeout=args.timeout,
+        interaction_duration=args.duration or 45,
+        cookies_file=args.cookies,
+        custom_headers=custom_headers,
+        user_agent=args.user_agent,
+        wait_selector=args.wait_selector,
+        save_bodies=args.save_bodies,
+        report=args.report,
+    )
+
+    try:
+        await banger.run()
+
+        return {
+            "target": target_url,
+            "output_dir": str(output_dir),
+            "final_url": banger.final_url,
+            "requests": len(banger.captured_requests),
+            "responses": len(banger.captured_responses),
+            "failures": len(banger.failed_requests),
+            "console": len(banger.console_logs),
+            "url_changes": len(banger.url_changes),
+            "bodies_saved": len(banger.saved_bodies),
+            "technologies": banger.detect_technologies(),
+            "interesting_endpoints": len(banger.find_interesting_endpoints()),
+            "status": "completed",
+        }
+
+    except Exception as e:
+        return {
+            "target": target_url,
+            "output_dir": str(output_dir),
+            "status": "error",
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+async def run_bulk_targets(targets, args, custom_headers):
+    output_base = Path(args.output) if args.output else Path("./gatekeeper_bulk_results")
+    output_base.mkdir(parents=True, exist_ok=True)
+
+    semaphore = asyncio.Semaphore(args.concurrency)
+    results = []
+
+    async def worker(target):
+        async with semaphore:
+            print("\n" + "=" * 80)
+            print(f"[*] Bulk scan target: {target}")
+            print("=" * 80)
+
+            result = await run_single_target(target, args, custom_headers, output_base)
+            results.append(result)
+
+            if args.delay > 0:
+                await asyncio.sleep(args.delay)
+
+    await asyncio.gather(*(worker(target) for target in targets))
+
+    results = sorted(results, key=lambda x: x.get("target", ""))
+
+    aggregate_file = output_base / "aggregate_report.json"
+
+    with open(aggregate_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "generated_at": datetime.now().isoformat(),
+                "total_targets": len(targets),
+                "completed": len([r for r in results if r.get("status") == "completed"]),
+                "errors": len([r for r in results if r.get("status") == "error"]),
+                "results": results,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print(f"\n[+] Bulk scan complete. Aggregate report saved to: {aggregate_file}")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="GATEkeeper - Browser interaction and network recon for authorized testing."
     )
 
     parser.add_argument("url", nargs="?", help="Target URL")
+    parser.add_argument("-i", "--input-file", type=Path, help="File containing targets, one domain or URL per line")
     parser.add_argument("-o", "--output", help="Output directory")
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
     parser.add_argument("--duration", type=int, default=None, help="Interaction duration in seconds")
@@ -703,6 +839,9 @@ def build_parser():
     parser.add_argument("--save-bodies", action="store_true", help="Save response bodies to disk")
     parser.add_argument("--report", action="store_true", help="Generate report.json")
     parser.add_argument("--non-interactive", action="store_true", help="Do not prompt for missing values")
+    parser.add_argument("--concurrency", type=int, default=2, help="Number of targets to scan at once in bulk mode")
+    parser.add_argument("--delay", type=float, default=0, help="Delay in seconds after each target finishes")
+    parser.add_argument("--scheme", default="https", choices=["http", "https"], help="Default scheme for bare domains")
 
     return parser
 
@@ -716,6 +855,21 @@ async def main():
     print("Authorized testing only. Captures browser network activity.")
     print("=" * 60)
 
+    custom_headers = parse_header(args.header)
+
+    if args.input_file:
+        targets = load_targets(args.input_file, default_scheme=args.scheme)
+
+        if not targets:
+            print("[!] No targets found in input file.")
+            sys.exit(1)
+
+        print(f"[*] Loaded {len(targets)} targets from {args.input_file}")
+        print(f"[*] Concurrency: {args.concurrency}")
+
+        await run_bulk_targets(targets, args, custom_headers)
+        return
+
     target_url = args.url
 
     if not target_url and not args.non_interactive:
@@ -725,8 +879,7 @@ async def main():
         print("[!] No URL provided. Exiting.")
         sys.exit(1)
 
-    if not target_url.startswith(("http://", "https://")):
-        target_url = "http://" + target_url
+    target_url = normalize_url(target_url, default_scheme=args.scheme)
 
     domain_name = sanitize_domain_name(target_url)
     default_output = f"./{domain_name}_bang"
@@ -759,8 +912,6 @@ async def main():
 
     if interaction_duration is None:
         interaction_duration = 45
-
-    custom_headers = parse_header(args.header)
 
     print("\n[*] Starting browser...")
 
