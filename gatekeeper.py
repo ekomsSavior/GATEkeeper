@@ -3,8 +3,7 @@
 GATEkeeper - Browser interaction + network recon for authorized testing.
 
 Features:
-- Single URL scanning
-- Bulk target scanning from file
+- Single URL scanning & Bulk target scanning from file
 - Interactive prompts or CLI arguments
 - Cookie loading
 - Custom headers
@@ -13,6 +12,7 @@ Features:
 - Optional response body dumping
 - Technology fingerprinting
 - Security header analysis
+- Lightweight DNS/IP/port/TLS recon
 - JSON report generation
 - Aggregate bulk report generation
 """
@@ -23,6 +23,8 @@ import hashlib
 import json
 import random
 import re
+import socket
+import ssl
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -34,6 +36,7 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 MAX_POST_CHARS = 5000
 MAX_BODY_BYTES = 10 * 1024 * 1024
+COMMON_PORTS = [80, 443, 8080, 8443, 8000, 8888, 3000, 5000]
 
 
 INTERESTING_TERMS = [
@@ -77,6 +80,126 @@ SECURITY_HEADERS = [
 ]
 
 
+PORT_SERVICE_HINTS = {
+    80: "http",
+    443: "https",
+    8080: "http-alt/proxy",
+    8443: "https-alt",
+    8000: "dev-http",
+    8888: "dev-http/proxy",
+    3000: "node/react/dev",
+    5000: "flask/dev-api",
+}
+
+
+async def tcp_check(host: str, port: int, timeout: float = 2.0):
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout,
+        )
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
+
+
+def resolve_host(host: str):
+    result = {
+        "host": host,
+        "canonical_name": None,
+        "aliases": [],
+        "ips": [],
+        "error": None,
+    }
+
+    try:
+        cname, aliases, ips = socket.gethostbyname_ex(host)
+        result["canonical_name"] = cname
+        result["aliases"] = aliases
+        result["ips"] = sorted(set(ips))
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+
+    return result
+
+
+def get_tls_info(host: str, port: int = 443, timeout: float = 3.0):
+    result = {
+        "host": host,
+        "port": port,
+        "subject": None,
+        "issuer": None,
+        "not_before": None,
+        "not_after": None,
+        "san": [],
+        "error": None,
+    }
+
+    try:
+        context = ssl.create_default_context()
+
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as ssock:
+                cert = ssock.getpeercert()
+
+        result["subject"] = cert.get("subject")
+        result["issuer"] = cert.get("issuer")
+        result["not_before"] = cert.get("notBefore")
+        result["not_after"] = cert.get("notAfter")
+
+        san = cert.get("subjectAltName", [])
+        result["san"] = [value for key, value in san if key.lower() == "dns"]
+
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+
+    return result
+
+
+async def light_recon(target_url: str, ports=None):
+    ports = ports or COMMON_PORTS
+    parsed = urlparse(target_url)
+    host = parsed.hostname
+
+    recon = {
+        "target_url": target_url,
+        "host": host,
+        "dns": {},
+        "open_ports": [],
+        "services": [],
+        "tls": None,
+        "error": None,
+    }
+
+    if not host:
+        recon["error"] = "Could not parse host from URL"
+        return recon
+
+    recon["dns"] = resolve_host(host)
+
+    checks = await asyncio.gather(
+        *(tcp_check(host, port) for port in ports),
+        return_exceptions=True,
+    )
+
+    for port, is_open in zip(ports, checks):
+        if is_open is True:
+            recon["open_ports"].append(port)
+            recon["services"].append(
+                {
+                    "port": port,
+                    "hint": PORT_SERVICE_HINTS.get(port, "unknown"),
+                }
+            )
+
+    if 443 in recon["open_ports"]:
+        recon["tls"] = get_tls_info(host, 443)
+
+    return recon
+
+
 class GatekeeperBanger:
     def __init__(
         self,
@@ -113,7 +236,9 @@ class GatekeeperBanger:
 
         self.final_html = None
         self.final_url = None
+        self.final_title = None
         self.main_response_headers = {}
+        self.recon = {}
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -128,6 +253,9 @@ class GatekeeperBanger:
         self.console_log_file = self.output_dir / "console_log.txt"
 
     async def run(self):
+        print("[*] Running lightweight target recon...")
+        self.recon = await light_recon(self.target_url)
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=self.headless,
@@ -208,6 +336,11 @@ class GatekeeperBanger:
             await self.simulate_interactions(page)
 
             self.final_url = page.url
+
+            try:
+                self.final_title = await page.title()
+            except Exception:
+                self.final_title = None
 
             try:
                 self.final_html = await page.content()
@@ -509,7 +642,6 @@ class GatekeeperBanger:
         for req in self.captured_requests:
             url = req.get("url", "")
             url_lower = url.lower()
-
             hit_terms = [term for term in INTERESTING_TERMS if term in url_lower]
 
             if hit_terms:
@@ -523,6 +655,29 @@ class GatekeeperBanger:
                 )
 
         return matches
+
+    def triage_score(self):
+        score = 0
+
+        nonstandard_ports = [p for p in self.recon.get("open_ports", []) if p not in (80, 443)]
+        score += len(nonstandard_ports) * 10
+        score += len(self.url_changes) * 8
+        score += len(self.find_interesting_endpoints()) * 4
+
+        missing_headers = [
+            h for h, v in self.analyze_security_headers().items()
+            if not v["present"]
+        ]
+        score += len(missing_headers)
+
+        if self.final_url and self.final_url != self.target_url:
+            score += 5
+
+        tech = self.detect_technologies()
+        if any(t in tech for t in ["WordPress", "Drupal", "IIS"]):
+            score += 5
+
+        return score
 
     def build_report(self):
         status_counter = Counter(r["status"] for r in self.captured_responses)
@@ -551,6 +706,9 @@ class GatekeeperBanger:
             "generated_at": datetime.now().isoformat(),
             "target": self.target_url,
             "final_url": self.final_url,
+            "final_title": self.final_title,
+            "triage_score": self.triage_score(),
+            "recon": self.recon,
             "summary": {
                 "total_requests": len(self.captured_requests),
                 "total_responses": len(self.captured_responses),
@@ -576,6 +734,9 @@ class GatekeeperBanger:
             "timestamp": datetime.now().isoformat(),
             "target": self.target_url,
             "final_url": self.final_url,
+            "final_title": self.final_title,
+            "triage_score": self.triage_score(),
+            "recon": self.recon,
             "url_changes": self.url_changes,
             "requests": self.captured_requests,
             "responses": self.captured_responses,
@@ -614,6 +775,7 @@ class GatekeeperBanger:
 
         print(f"Initial URL: {self.target_url}")
         print(f"Final URL:   {self.final_url}")
+        print(f"Title:       {self.final_title}")
         print(f"Requests:    {len(self.captured_requests)}")
         print(f"Responses:   {len(self.captured_responses)}")
         print(f"Failures:    {len(self.failed_requests)}")
@@ -621,10 +783,37 @@ class GatekeeperBanger:
         print(f"URL changes: {len(self.url_changes)}")
         print(f"Bodies saved:{len(self.saved_bodies)}")
 
+        print("\n" + "-" * 60)
+        print("LIGHTWEIGHT RECON")
+        print("-" * 60)
+        print(f"Host:        {self.recon.get('host')}")
+        print(f"IPs:         {self.recon.get('dns', {}).get('ips', [])}")
+        print(f"Canonical:   {self.recon.get('dns', {}).get('canonical_name')}")
+        print(f"Aliases:     {self.recon.get('dns', {}).get('aliases', [])}")
+        print(f"Open ports:  {self.recon.get('open_ports', [])}")
+
+        services = self.recon.get("services", [])
+        if services:
+            print("\n[+] Service hints:")
+            for service in services:
+                print(f"  - {service.get('port')}: {service.get('hint')}")
+
+        tls = self.recon.get("tls") or {}
+        if tls:
+            print("\n[+] TLS info:")
+            print(f"  Not before: {tls.get('not_before')}")
+            print(f"  Not after:  {tls.get('not_after')}")
+            if tls.get("san"):
+                print(f"  SAN count:  {len(tls.get('san', []))}")
+                for san in tls.get("san", [])[:10]:
+                    print(f"    - {san}")
+            if tls.get("error"):
+                print(f"  TLS error:  {tls.get('error')}")
+
         redirects = [r for r in self.captured_responses if r["status"] in (301, 302, 303, 307, 308)]
 
         if redirects:
-            print(f"\n[!] Redirect responses detected: {len(redirects)}")
+            print(f"\n[!] Redirects detected: {len(redirects)}")
             for r in redirects[:20]:
                 location = r["headers"].get("location", "N/A")
                 print(f"  {r['status']} {r['url'][:100]} -> {location}")
@@ -644,14 +833,24 @@ class GatekeeperBanger:
             print("\n[+] Detected technologies:")
             for tech in technologies:
                 print(f"  - {tech}")
+        else:
+            print("\n[-] No configured technology signatures detected.")
 
         security = self.analyze_security_headers()
         missing = [h for h, v in security.items() if not v["present"]]
+
+        present = [h for h, v in security.items() if v["present"]]
+        if present:
+            print("\n[+] Present common security headers:")
+            for header in present:
+                print(f"  - {header}: {security[header].get('value')}")
 
         if missing:
             print("\n[!] Missing common security headers:")
             for header in missing:
                 print(f"  - {header}")
+        else:
+            print("\n[+] All configured common security headers are present.")
 
         if self.final_html:
             html_lower = self.final_html.lower()
@@ -664,16 +863,15 @@ class GatekeeperBanger:
         else:
             print("\n[-] No final HTML captured.")
 
+        print(f"\n[+] Triage score: {self.triage_score()}")
+
 
 def normalize_url(value: str, default_scheme: str = "https") -> str:
     value = value.strip().strip(",")
-
     if not value:
         return ""
-
     if not value.startswith(("http://", "https://")):
         value = f"{default_scheme}://{value}"
-
     return value
 
 
@@ -683,12 +881,9 @@ def load_targets(input_file: Path, default_scheme: str = "https") -> list[str]:
     with open(input_file, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-
             if not line or line.startswith("#"):
                 continue
-
             url = normalize_url(line, default_scheme=default_scheme)
-
             if url:
                 targets.append(url)
 
@@ -755,10 +950,21 @@ async def run_single_target(target_url, args, custom_headers, output_base=None):
     try:
         await banger.run()
 
+        tls = banger.recon.get("tls") or {}
+
         return {
             "target": target_url,
             "output_dir": str(output_dir),
             "final_url": banger.final_url,
+            "final_title": banger.final_title,
+            "triage_score": banger.triage_score(),
+            "ips": banger.recon.get("dns", {}).get("ips", []),
+            "canonical_name": banger.recon.get("dns", {}).get("canonical_name"),
+            "aliases": banger.recon.get("dns", {}).get("aliases", []),
+            "open_ports": banger.recon.get("open_ports", []),
+            "services": banger.recon.get("services", []),
+            "tls_not_before": tls.get("not_before"),
+            "tls_not_after": tls.get("not_after"),
             "requests": len(banger.captured_requests),
             "responses": len(banger.captured_responses),
             "failures": len(banger.failed_requests),
@@ -800,7 +1006,11 @@ async def run_bulk_targets(targets, args, custom_headers):
 
     await asyncio.gather(*(worker(target) for target in targets))
 
-    results = sorted(results, key=lambda x: x.get("target", ""))
+    results = sorted(
+        results,
+        key=lambda x: x.get("triage_score", 0),
+        reverse=True,
+    )
 
     aggregate_file = output_base / "aggregate_report.json"
 
@@ -811,7 +1021,7 @@ async def run_bulk_targets(targets, args, custom_headers):
                 "total_targets": len(targets),
                 "completed": len([r for r in results if r.get("status") == "completed"]),
                 "errors": len([r for r in results if r.get("status") == "error"]),
-                "results": results,
+                "results_ranked_by_triage_score": results,
             },
             f,
             indent=2,
